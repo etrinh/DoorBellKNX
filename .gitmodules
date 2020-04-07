@@ -1,0 +1,9 @@
+[submodule "lib/knx"]
+	path = lib/knx
+	url = https://github.com/etrinh/knx.git
+[submodule "lib/ESP8266Audio"]
+	path = lib/ESP8266Audio
+	url = https://github.com/etrinh/ESP8266Audio.git
+[submodule "lib/WIFIMANAGER-ESP32"]
+	path = lib/WIFIMANAGER-ESP32
+	url = https://github.com/etrinh/WIFIMANAGER-ESP32.git
