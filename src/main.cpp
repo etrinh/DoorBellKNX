@@ -1,7 +1,7 @@
 /*
     DoorBell KNX
 */
-
+#define NO_GLOBAL_INSTANCES
 #define FW_TAG       "DoorBell KNX"
 #define FW_VERSION   "1.00"
 
@@ -9,11 +9,12 @@
 #define ENABLE_MP3
 #define ENABLE_FLAC
 #define ENABLE_WAV
-#define ENABLE_MIDI
+//#define ENABLE_MIDI   // https://github.com/earlephilhower/ESP8266Audio/issues/240 + printf in midi + tinysoundfont
 #define ENABLE_MOD
 #define ENABLE_AAC
 
 #include <Arduino.h>
+#include <esp_pm.h>
 #include <knx.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
@@ -51,6 +52,8 @@
 #include <EEPROM.h>
 #include <WebServer.h>
 
+#define WATCHDOG_TIMEOUT  (10 * 60 * 1000 * 1000)
+
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 
 #define MIN(X,Y)    ((X)<(Y)?(X):(Y))
@@ -68,9 +71,15 @@
 #define PIN_TPUART_RESET  NC   // Unused
 
 #define PIN_MUTE          23
-#define PIN_DAC           25
+#define PIN_DAC           0  //PIN 25 -> https://github.com/earlephilhower/ESP8266Audio/issues/95
 
 #define NBBANKS           32
+#define BANK_MAXNAMESIZE  32
+#define META_PATH         "/meta"
+#ifdef ENABLE_MIDI
+# define SOUNDFONT_SUFFIX  ".sf2"
+# define SOUNDFONT_PATH    "/soundfont" SOUNDFONT_SUFFIX
+#endif
 
 class NullStream : public Stream
 {
@@ -144,14 +153,26 @@ struct Output
 
 struct Player
 {
-    void init(int baseAddr, uint16_t baseGO, uint16_t pinNb, uint16_t mutePinNb)
+    enum FORMAT : uint8_t { UNKNOWN = (uint8_t)-1, NO_FILE = 0, MP3, AAC, FLAC, WAV, MOD, MIDI };
+    void init(uint16_t pinNb, uint16_t mutePinNb)
     {
-        (void)pinNb;
+        memset(m_names, 0, sizeof(m_names));
+        File f = SPIFFS.open(META_PATH, FILE_READ);
+        if (f.available()) {
+            f.read((uint8_t*)m_names, sizeof(m_names));
+        }
+        f.close();
+
         m_mutePin = mutePinNb;
         pinMode(m_mutePin, OUTPUT);
-        pinMode(pinNb, ANALOG);
+//        pinMode(pinNb, ANALOG);
         m_out.SetOutputModeMono(true);
+        autodetect();
+    }
 
+    void initKNX(int baseAddr, uint16_t baseGO)
+    {
+        (void)baseAddr;
         m_GO.playStop = baseGO;
         knx.getGroupObject(m_GO.playStop).dataPointType(DPT_Value_1_Ucount);
         knx.getGroupObject(m_GO.playStop).callback([this](GroupObject& go) {
@@ -196,8 +217,6 @@ struct Player
             knx.getGroupObject(m_GO.play[i]).dataPointType(DPT_Switch);
             knx.getGroupObject(m_GO.play[i]).callback([this,i](GroupObject& go) { play(i); });
         }
-        SPIFFS.begin(true);
-        autodetect(UINT32_MAX);
     }
 
     void play(int bank) {
@@ -207,10 +226,25 @@ struct Player
         }
     }
 
-    uint8_t volume() const { return (uint8_t)knx.getGroupObject(m_GO.volume).value() - 1; }
-    void setVolume(int value)
+    void stop() {
+        if (m_player) m_action = STOP;
+    }
+    int playingBank() const {
+        return m_playingChannel;
+    }
+
+    FORMAT format(int bank) const {
+        if (pathFromChannel(bank)) {
+            return m_format[bank - 1];
+        }
+        return NO_FILE;
+    }
+
+    uint8_t volume() const { return m_volume; }
+    void setVolume(uint8_t value)
     {
-        knx.getGroupObject(m_GO.volume).value(value + 1);   // offset 1 because 0 is reserved when not init
+        if (knx.configured())
+            knx.getGroupObject(m_GO.volume).value(value + 1);   // offset 1 because 0 is reserved when not init
         _setVolume(value);
     }
     void setVolume(const KNXValue& value)
@@ -218,9 +252,10 @@ struct Player
         _setVolume((uint8_t)value - 1);
     }
 
-    void autodetect(uint32_t channel) {
+    void autodetect(uint32_t channel = UINT32_MAX) {
         if (channel == UINT32_MAX) {
-            for (int i = 0; i < NBBANKS; ++i)   autodetect(channel + 1);
+            for (int i = 1; i <= NBBANKS; ++i)   autodetect(i);
+            return;
         }
         const char* path = pathFromChannel(channel);
         if (path == NULL) return;
@@ -233,8 +268,7 @@ struct Player
                 if (buffer[1] == 0xF1 || buffer[1] == 0xF9) {
                     format = AAC;
                 }
-                else
-                if (buffer[1] == 0xFB) {
+                else if (buffer[1] == 0xFB) {
                     format = MP3;
                 }
             }
@@ -254,8 +288,33 @@ struct Player
                 format = MOD;
             }
         }
+        else {
+            format = NO_FILE;
+        }
         f.close();
-        m_format[channel] = format;
+        m_format[channel - 1] = format;
+    }
+    String channelName(uint32_t channel)
+    {
+        if (pathFromChannel(channel) == NULL) return String();
+        String n;
+        n.reserve(BANK_MAXNAMESIZE);
+        char * p = m_names[channel - 1];
+        for (int i = 0; i < BANK_MAXNAMESIZE && *p; ++i, ++p) 
+            n += *p;
+        return n;
+    }
+    void setChannelName(uint32_t channel, String name)
+    {
+        if (pathFromChannel(channel) == NULL) return;
+        m_names[channel - 1][0] = 0; 
+        strncpy(m_names[channel - 1], name.c_str(), BANK_MAXNAMESIZE);
+        m_names[channel - 1][MIN(BANK_MAXNAMESIZE - 1, name.length())] = 0;
+        File f = SPIFFS.open(META_PATH, "w");
+        if (f.available()) {
+            f.write((uint8_t*)m_names, sizeof(m_names));
+        }
+        f.close();
     }
     static const char* pathFromChannel(uint32_t channel)
     {
@@ -267,18 +326,33 @@ struct Player
             F("/bank_21"), F("/bank_22"), F("/bank_23"), F("/bank_24"),
             F("/bank_25"), F("/bank_26"), F("/bank_27"), F("/bank_28"),
             F("/bank_29"), F("/bank_30"), F("/bank_31"), F("/bank_32") };
-        if (channel >= sizeof(Banks)/sizeof(Banks[0])) {
+        if (channel == 0 || channel > sizeof(Banks)/sizeof(Banks[0])) {
             return NULL;
         }
-        return (const char*)Banks[channel];
+        return (const char*)Banks[channel - 1];
+    }
+    void removeChannel(uint32_t channel)
+    {
+        const char* path = pathFromChannel(channel);
+        if (path) {
+            SPIFFS.remove(path);
+            setChannelName(channel, String());
+            m_format[channel - 1] = NO_FILE;
+        }
     }
 
+#ifdef ENABLE_MIDI
+    bool hasSoundFont() const
+    {
+        return SPIFFS.exists(SOUNDFONT_PATH);
+    }
+#endif
     AudioGenerator* audioGeneratorbuilder(uint32_t channel)
     {
         if (pathFromChannel(channel) == NULL) {
             return NULL;
         }
-        switch (m_format[channel]) {
+        switch (m_format[channel - 1]) {
 #ifdef ENABLE_AAC
             case AAC: return new AudioGeneratorAAC(); break;
 #endif
@@ -286,7 +360,16 @@ struct Player
             case MP3: return new AudioGeneratorMP3(); break;
 #endif
 #ifdef ENABLE_MIDI
-            case MIDI: return new AudioGeneratorMIDI(); break;
+            case MIDI: {
+                if (hasSoundFont()) {
+                    AudioGeneratorMIDI* midiGen = new AudioGeneratorMIDI();
+                    delete m_sf2;
+                    m_sf2 = new AudioFileSourceSPIFFS(SOUNDFONT_PATH);
+                    midiGen->SetSoundfont(m_sf2);
+                    midiGen->SetSampleRate(22050);
+                    return midiGen;
+                }
+             } break;
 #endif
 #ifdef ENABLE_FLAC
             case FLAC: return new AudioGeneratorFLAC(); break;
@@ -297,39 +380,46 @@ struct Player
 #ifdef ENABLE_MOD
             case MOD: return new AudioGeneratorMOD(); break;
 #endif
-            default: return NULL; break;
+            default: break;
         }
+        return NULL;
     }
 
     void loop()
     {
         switch (m_action) {
             case PLAY: {
+                uint32_t channel = m_playingChannel;
                 clear();
-                const char* path = pathFromChannel(m_playingChannel);
+                const char* path = pathFromChannel(channel);
                 if (path) {
                     m_file = new AudioFileSourceSPIFFS(path);
                     if (m_file) {
-                        m_player = audioGeneratorbuilder(m_playingChannel);
+                        m_player = audioGeneratorbuilder(channel);
                         if (m_player) {
-                            knx.getGroupObject(m_GO.playingChannel).value(m_playingChannel + 1);
-                            knx.getGroupObject(m_GO.play[m_playingChannel]).value(true);
+                            if (knx.configured()) {
+                                knx.getGroupObject(m_GO.playingChannel).value(channel);
+                                knx.getGroupObject(m_GO.play[channel - 1]).value(true);
+                                knx.getGroupObject(m_GO.playing).value(true);
+                            }
                             m_player->begin(m_file, &m_out);
-                            knx.getGroupObject(m_GO.playing).value(true);
-                            m_action = NONE;
                             digitalWrite(m_mutePin, false);
+                            m_playingChannel = channel;
                         }
                         else {
                             delete m_file; m_file = NULL;
                         }
                     }
+                    m_action = NONE;
                 }
             }; break;
             case STOP: {
                 if (m_player && m_player->isRunning()) {
-                    knx.getGroupObject(m_GO.playing).value(false);
-                    knx.getGroupObject(m_GO.play[m_playingChannel]).value(false);
-                    knx.getGroupObject(m_GO.playingChannel).value(0);
+                    if (knx.configured()) {
+                        knx.getGroupObject(m_GO.playing).value(false);
+                        knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(false);
+                        knx.getGroupObject(m_GO.playingChannel).value(0);
+                    }
                     m_player->stop();
                     clear();
                 }
@@ -337,14 +427,18 @@ struct Player
             }; break;
             case PAUSE: {
                 if (m_player && m_player->isRunning()) {
-                    knx.getGroupObject(m_GO.playing).value(false);
-                    knx.getGroupObject(m_GO.play[m_playingChannel]).value(false);
+                    if (knx.configured()) {
+                        knx.getGroupObject(m_GO.playing).value(false);
+                        knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(false);
+                    }
                 }
             }; break;
             case RESUME: {
                 if (m_player && m_player->isRunning()) {
-                    knx.getGroupObject(m_GO.playing).value(true);
-                    knx.getGroupObject(m_GO.play[m_playingChannel]).value(true);
+                    if (knx.configured()) {
+                        knx.getGroupObject(m_GO.playing).value(true);
+                        knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(true);
+                    }
                 }
                 m_action = NONE;
             }; break;
@@ -352,15 +446,18 @@ struct Player
         }
         if (m_player && m_player->isRunning() && m_action != PAUSE) {
             if (!m_player->loop()) {
-                knx.getGroupObject(m_GO.playing).value(false);
-                knx.getGroupObject(m_GO.play[m_playingChannel]).value(false);
-                knx.getGroupObject(m_GO.playingChannel).value(0);
+                if (knx.configured()) {
+                    knx.getGroupObject(m_GO.playing).value(false);
+                    knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(false);
+                    knx.getGroupObject(m_GO.playingChannel).value(0);
+                }
                 m_player->stop();
                 clear();
             }
         }
     }
 
+  private:
     void clear()
     {
         m_playingChannel = 0;
@@ -372,17 +469,23 @@ struct Player
             delete m_file;
             m_file = NULL;
         }
+        if (m_sf2) {
+            delete m_sf2;
+            m_sf2 = NULL;
+        }
         if (m_player) {
             delete m_player;
             m_player = NULL;
         }
     }
-  private:
+
     void _setVolume(uint8_t value)
     {
+        m_volume = value;
         m_out.SetGain(MIN(value, 100) * 4.f / 100);
     }
 
+    uint8_t m_volume = 100;
     enum ACTION { NONE, STOP, PLAY, PAUSE, RESUME } m_action;
     int m_playingChannel;
     struct {
@@ -399,8 +502,10 @@ struct Player
     int m_mutePin;
     AudioGenerator *m_player = NULL;
     AudioFileSourceSPIFFS *m_file = NULL;
+    AudioFileSourceSPIFFS *m_sf2 = NULL;
     AudioOutputI2S m_out = AudioOutputI2S(PIN_DAC, AudioOutputI2S::INTERNAL_DAC);
-    enum FORMAT : uint8_t { UNKNOWN, MP3, AAC, FLAC, WAV, MOD, MIDI } m_format[NBBANKS];
+    FORMAT m_format[NBBANKS];
+    char m_names[NBBANKS][BANK_MAXNAMESIZE];
   public:
     enum { NBGO = sizeof(m_GO)/sizeof(uint16_t), SIZEPARAMS = sizeof(m_params) };    
 } player;
@@ -413,6 +518,7 @@ struct Player
 #define URI_UPLOAD "/upload"
 #define URI_STATUS "/status"
 #define URI_PLAY "/play"
+#define URI_STOP "/stop"
 #define URI_VOLUME "/volume"
 #define URI_FORMAT "/format"
 #define URI_REMOVE "/remove"
@@ -424,15 +530,6 @@ WebServer server ( WEB_SERVER_PORT );
 #define OTA_REBOOT_TIMER (1)
 
 int64_t rebootRequested = 0;
-bool uploadStatus = false;
-
-String ip2Str(IPAddress ip) {
-    String s;
-    for (int i = 0; i < 4; i++) {
-        s += i  ? "." + String(ip[i]) : String(ip[i]);
-    }
-    return s;
-}
 
 static void requestReboot(int timer = REBOOT_TIMER)
 {
@@ -444,7 +541,7 @@ static void requestReboot(int timer = REBOOT_TIMER)
     }
 }
 
-static void startServer() {
+static void initWebServer() {
     server.on ( URI_ROOT, [](){
         const __FlashStringHelper* info =
           F("<html>"
@@ -469,15 +566,20 @@ static void startServer() {
                         "document.getElementById(\"rssi\").innerHTML = obj.rssi;"
                         "document.getElementById(\"ip\").innerHTML = obj.ip;"
                         "document.getElementById(\"mac\").innerHTML = obj.mac;"
+                        "document.getElementById(\"playing\").innerHTML = obj.playing>0?(obj.playing):\"\";"
                         "document.getElementById(\"vol\").value = obj.volume;"
                         "document.getElementById(\"reboot\").innerHTML = obj.rebootTimer>0?\" - \"+obj.rebootTimer:\"\";"
+#ifdef ENABLE_MIDI
+                        "document.getElementById(\"soundfont\").innerHTML = obj.hasSoundFont?\"Yes\":\"No\";"
+#endif
+                        "document.getElementById(\"bankName\").innerHTML = obj.banks[document.getElementById(\"bank\").value-1].name;"
                         "}"
                     "}"
                     "};"
                     "xhr.send(null);"
                 "};"
                 "update();"
-                "setInterval(update, 1000);"
+                "setInterval(update, 5000);"
                 "</script>"
             "</head>"
             "<body>"
@@ -493,14 +595,22 @@ static void startServer() {
                         "<span class=\"info\">IP: </span><span id=\"ip\"></span>"
                         "<br/>"
                         "<span class=\"info\">MAC: </span><span id=\"mac\"></span>"
+                        "<br/>"
+#ifdef ENABLE_MIDI
+                        "<span class=\"info\">Has SoundFont (sf2 file for MIDI playback): </span><span id=\"soundfont\"></span>"
+                        "<br/>"
+#endif
+                        "<span class=\"info\">Playing: </span><span id=\"playing\"></span>"
                     "</td>"
                     "</tr>"
                     "<tr>"
                     "<td style=\"width: 50%;\">"
-                        "Bell: <input id=\"bank\" type=\"number\" min=\"1\" max=\"" STRINGIFY(NBBANK) "\" value=\"1\" onchange=\"document.getElementById('uploadForm').action = '" URI_UPLOAD "?id=this.value'\" required>"
-                        "<input type=\"button\" onclick=\"invoke('" URI_PLAY "?id=document.getElementById('bank').value')\" value=\"Play\"/>"
-                        "<input type=\"button\" onclick=\"invoke('" URI_REMOVE "?id=document.getElementById('bank').value')\" value=\"Clear\"/>"
-                        "<form id=\"uploadForm\" method=\"post\" enctype=\"multipart/form-data\" action=\"\"><span class=\"action\">Upload: </span><input type=\"file\" name=\"fileToUpload\" id=\"uploadFile\" /><input type=\"submit\" value=\"Upload\" id=\"uploadSubmit\"/></form>"
+                        "Bell: <input id=\"bank\" type=\"number\" min=\"1\" max=\"" STRINGIFY(NBBANKS) "\" value=\"1\" onchange=\"document.getElementById('uploadForm').action = '" URI_UPLOAD "?id='+this.value; update();\" required>"
+                        "<span id=\"bankName\"></span>"
+                        "<input type=\"button\" onclick=\"invoke('" URI_PLAY "?id='+document.getElementById('bank').value)\" value=\"Play\"/>"
+                        "<input type=\"button\" onclick=\"invoke('" URI_STOP "')\" value=\"Stop\"/>"
+                        "<input type=\"button\" onclick=\"invoke('" URI_REMOVE "?id='+document.getElementById('bank').value)\" value=\"Clear\"/>"
+                        "<form id=\"uploadForm\" method=\"post\" enctype=\"multipart/form-data\" action = \"" URI_UPLOAD "?id=1\"><span class=\"action\">Upload: </span><input type=\"file\" name=\"fileToUpload\" id=\"uploadFile\" /><input type=\"submit\" value=\"Upload\" id=\"uploadSubmit\"/></form>"
                         "<br/>"
                         "Volume: <input type=\"range\" id=\"vol\" min=\"0\" max=\"100\" onchange=\"invoke('" URI_VOLUME "?value='+this.value)\"/>"
                         "<br/>"
@@ -522,20 +632,33 @@ static void startServer() {
             "</html>");
         server.send(200, F("text/html"), info);
       });
-    server.on ( URI_PLAY, [](){ player.play(server.arg("id").toInt()); });
-    server.on ( URI_VOLUME, [](){ if (!server.arg("value").isEmpty()) player.setVolume(server.arg("value").toInt()); });
+    server.on ( URI_PLAY, [](){ player.play(server.arg("id").toInt()); server.send(200); });
+    server.on ( URI_STOP, [](){ player.stop(); server.send(200); });
+    server.on ( URI_VOLUME, [](){ if (!server.arg("value").isEmpty()) player.setVolume(server.arg("value").toInt()); server.send(200); });
     server.on ( URI_STATUS, [](){
         unsigned long currentTimer = millis();
+        String banks;
+        for (size_t i = 1; i <= NBBANKS; ++i) {
+            banks += "{\"bank\":" + String(i) + ",\"format\":" + String(player.format(i)) + ",\"name\":\"" + player.channelName(i) + "\"}";
+            if (i < NBBANKS) banks += ",";
+        }
         String info = "{"
                         "\"firmware\":\"" FW_TAG "\","
                         "\"version\":\"" FW_VERSION "\","
                         "\"ssid\":\"" + WiFi.SSID() + "\","
                         "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
-                        "\"ip\":\"" + ip2Str(WiFi.localIP()) + "\","
+                        "\"ip\":\"" + WiFi.localIP().toString() + "\","
                         "\"mac\":\"" + WiFi.macAddress() + "\","
+                        "\"playing\":\"" + String(player.playingBank()) + "\","
+                        "\"banks\":[" + banks + "],"
+#ifdef ENABLE_MIDI
+                        "\"hasSoundFont\":" + String(player.hasSoundFont()) + ","
+#endif
                         "\"volume\":\"" + String(player.volume()) + "\","
                         "\"chipId\":\"" + String((uint32_t)ESP.getEfuseMac()) + "\","
                         "\"reboot\":\"" + String(rebootRequested > 0 ? "true" : "false") + "\","
+                        "\"usedSpace\":" + String(SPIFFS.usedBytes()) + ","
+                        "\"totalSpace\":" + String(SPIFFS.totalBytes()) + ","
                         "\"rebootTimer\":" + String(MAX(0, int((rebootRequested - currentTimer) / 1000))) + ""
                         "}";
         server.send(200, F("application/json"), info);
@@ -547,75 +670,77 @@ static void startServer() {
       });
     server.on ( URI_REBOOT, [](){
         server.send(200);
-        esp_wifi_restore();
         requestReboot(0);
       });
     server.on ( URI_FORMAT, [](){
-        SPIFFS.end();
         server.send(SPIFFS.format()?200:500);
-        SPIFFS.begin();
-        player.autodetect(UINT32_MAX);
+        player.autodetect();
+        server.send(200);
       });
     server.on ( URI_REMOVE, [](){
-        int channel = server.arg("id").toInt() - 1;
-        const char* path = player.pathFromChannel(channel);
-        if (path) {
-            SPIFFS.remove(path);
-            player.autodetect(channel);
-        }
+        int channel = server.arg("id").toInt();
+        player.removeChannel(channel);
         server.send(200);
       });
     server.on ( URI_UPLOAD, HTTP_POST, []() {
-        String html = "<html>"
+        const __FlashStringHelper* html = F("<html>"
                         "<head>"
-                          "<title>" FW_TAG " - OTA</title>" +
-                          String(uploadStatus ? "<meta http-equiv=\"refresh\" content=\"url=/\">" : "") +
+                          "<meta http-equiv=\"refresh\" content=\"0;url=/\">"
                         "</head>"
-                        "<body>" + (!uploadStatus ? "FAIL" : "OK") + "</body>"
-                      "</html>";
+                      "</html>");
         server.sendHeader(F("Connection"), F("close"));
         server.send(200, F("text/html"), html);
-        requestReboot();
       }, [](){
         HTTPUpload& upload = server.upload();
-        int channel = server.arg("id").toInt() - 1;
+        int channel = server.arg("id").toInt();
+        static File file;
+        static String fileName;
         if (upload.status == UPLOAD_FILE_START) {
-            if (uploadStatus) {
-                const char* path = player.pathFromChannel(channel);
-                if (path) {
-                    File file = SPIFFS.open(path, FILE_WRITE);
-                    if (!file.available()) {
-                        uploadStatus = false;
-                    }
-                    file.close();
-                    player.autodetect(channel);
-                }
-                else {
-                    uploadStatus = false;
-                }
+#ifdef ENABLE_MIDI
+            String lowerFileName = upload.filename;
+            lowerFileName.toLowerCase();
+            if (lowerFileName.endsWith(SOUNDFONT_SUFFIX)) {
+                fileName = SOUNDFONT_PATH;
+            }
+            else {
+                fileName = player.pathFromChannel(channel);
+            }
+#else
+            fileName = player.pathFromChannel(channel);
+#endif
+            if (fileName) {
+                SPIFFS.remove(fileName);
+                file = SPIFFS.open(fileName, FILE_WRITE);
             }
         } else if (upload.status == UPLOAD_FILE_WRITE) {
-            if (uploadStatus) {
-                const char* path = player.pathFromChannel(channel);
-                if (path) {
-                    File file = SPIFFS.open(path, FILE_APPEND);
-                    if (file.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                        // error
-                        uploadStatus = false;
-                    }
+            if (file) {
+                if (file.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                    // error
                     file.close();
-                }
-                else {
-                    uploadStatus = false;
                 }
             }
         } else if (upload.status == UPLOAD_FILE_END) {
-            player.autodetect(channel);
-        } else if (upload.status == UPLOAD_FILE_ABORTED) {
-            const char* path = player.pathFromChannel(channel);
-            if (path) {
-                SPIFFS.remove(path);
+            if (file) {
+#ifdef ENABLE_MIDI
+                if (!fileName.endsWith(SOUNDFONT_SUFFIX)) {
+#else
+                {
+#endif
+                    player.autodetect(channel);
+                    if ((player.format(channel) == Player::UNKNOWN || player.format(channel) == Player::NO_FILE)) {
+                        player.removeChannel(channel);
+                    }
+                    else {
+                        player.setChannelName(channel, upload.filename);
+                    }
+                }
             }
+            else {
+                SPIFFS.remove(fileName);
+            }
+        } else if (upload.status == UPLOAD_FILE_ABORTED) {
+            file.close();
+            SPIFFS.remove(fileName);
         }
         yield();
       } );
@@ -623,40 +748,51 @@ static void startServer() {
      server.on ( URI_UPDATE, HTTP_POST, []() {
         String html = "<html>"
                         "<head>"
-                          "<title>" FW_TAG " - OTA</title>" +
-                          (Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER) + "; url=/\">" : "") +
+                        "<title>" FW_TAG " - Update</title>" +
+                        (!Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 3) + "; url=/\">" : "") +
                         "</head>"
-                        "<body>" + (Update.hasError() ? "FAIL" : "OK") + "</body>"
-                      "</html>";
+                        "<body>Update " + (Update.hasError() ? "failed" : "succeeded") + "</body>"
+                    "</html>";
         server.sendHeader(F("Connection"), F("close"));
         server.send(200, F("text/html"), html);
         requestReboot();
       }, [](){
         HTTPUpload& upload = server.upload();
         if (upload.status == UPLOAD_FILE_START) {
-            uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-            if (!Update.begin(maxSketchSpace)) { //start with max available size
-                Update.printError(Serial);
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
             }
         } else if (upload.status == UPLOAD_FILE_WRITE) {
             if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                Update.printError(Serial);
             }
         } else if (upload.status == UPLOAD_FILE_END) {
             if (!Update.end(true)) { //true to set the size to the current progress
-                Update.printError(Serial);
             }
         }
         yield();
       } );
 #endif
-    server.begin();
 }
 
+hw_timer_t *watchdog = NULL;
 bool wifiOn = true;
+static bool wifiForProgramming = false;
 void setup()
 {
+    // Stop Bluetooth
+    btStop();
+
+    // set frequency to 80Mhz
+    esp_pm_config_esp32_t pm_config;
+    pm_config.max_freq_mhz = 80;
+    pm_config.min_freq_mhz = 80;
+    pm_config.light_sleep_enable = false;
+    esp_pm_configure(&pm_config);
+
+    // No Debug 
+    esp_log_level_set("*", ESP_LOG_NONE);
+    uartSetDebug(NULL);
     ArduinoPlatform::SerialDebug = &nullDevice;
+
     static HardwareSerial serialTpuart(TPUART);
     knx.platform().knxUart(&serialTpuart);
     knx.ledPin(PIN_PROG_LED);
@@ -667,28 +803,42 @@ void setup()
     // read adress table, association table, groupobject table and parameters from eeprom
     knx.readMemory();
 
+    SPIFFS.begin(true);
+
+    player.init(PIN_DAC, PIN_MUTE);
+
     if (knx.configured()) {
         uint16_t offsetGO = 0; int offsetParam = 0;
         // Wifi On/Off
         wifiOn = false;
+        wifiForProgramming = false;
         knx.getGroupObject(offsetGO).dataPointType(DPT_Switch);
-        knx.getGroupObject(offsetGO).callback([](GroupObject& go) { wifiOn = go.value(); });
+        knx.getGroupObject(offsetGO).callback([](GroupObject& go) { wifiOn = go.value(); wifiForProgramming = false; });
         knx.getGroupObject(offsetGO).value(false);
         ++offsetGO;
         for (uint16_t i = 0; i < outputCount; ++i, offsetGO += Output::NBGO, offsetParam += Output::SIZEPARAMS) {
             output[i].init(offsetParam, offsetGO, outputPins[i]);
         }
-        player.init(offsetGO, offsetParam, PIN_DAC, PIN_MUTE);
+        player.initKNX(offsetGO, offsetParam);
     }
 
     // start the framework.
     knx.start();
 
-    startServer();
+    watchdog = timerBegin(0, 80, true); //timer 0, div 80
+    timerAttachInterrupt(watchdog, &esp_restart, true);
+    timerAlarmWrite(watchdog, WATCHDOG_TIMEOUT, false); //set time in us
+    timerAlarmEnable(watchdog); //enable interrupt
+
+    WiFi.disconnect(true);  // WiFi off managed at runtime
+    initWebServer();
 }
 
+enum SERVER_STATE: uint8_t { DISCONNECTED, CONNECTING, CONNECTED, RUNNING } serverState = DISCONNECTED;
 void loop() 
 {
+    timerWrite(watchdog, 0); //reset timer (feed watchdog)
+
     // don't delay here to much. Otherwise you might lose packages or mess up the timing with ETS
     knx.loop();
 
@@ -703,17 +853,33 @@ void loop()
             }
             lastTime = time;
         }
-        player.loop();
+    }
+    player.loop();
 
-        if (wifiOn || knx.progMode()) {
-            if (!WiFi.isConnected()) {
-                // Wi-Fi connection - Connecte le module au réseau Wi-Fi
-                // attempt to connect; should it fail, fall back to AP
-                WiFiManager().autoConnect((FW_TAG + String((uint32_t)ESP.getEfuseMac())).c_str(), "");
-            }
+    if (wifiOn) {
+        if (serverState == DISCONNECTED) {
+            serverState = CONNECTING;
+            WiFiManager wm;
+            wm.setConfigPortalTimeout(PROG_TIMEOUT / 1000);
+            wm.setLoopCallback(&loop);  // main loop is called
+            wm.autoConnect((FW_TAG "-" + String((uint32_t)ESP.getEfuseMac())).c_str(), "");
+            if (serverState == DISCONNECTED)
+                wifiOn = false;
+            serverState = WiFi.isConnected()?CONNECTED:DISCONNECTED;
+        }
+    }
+    if (serverState == CONNECTED) {
+        server.begin();
+        serverState = RUNNING;
+    }
+    if (serverState == RUNNING) {
+        if (wifiOn) {
+            server.handleClient();
         }
         else {
+            server.stop();
             WiFi.disconnect(true);
+            serverState = DISCONNECTED;
         }
     }
 
@@ -721,11 +887,18 @@ void loop()
     if (knx.progMode()) {
         if (timerProgMode == 0) {
             timerProgMode = millis();
+            if (!wifiOn) {
+                wifiOn = true;
+                wifiForProgramming = true;
+            }
         }
         else {
-            if (millis() - timerProgMode > PROG_TIMEOUT) {
+            if (millis() > timerProgMode + PROG_TIMEOUT) {
                 knx.progMode(false);
                 timerProgMode = 0;
+                if (wifiForProgramming) {
+                    wifiOn = false;
+                }
             }
         }
     }
@@ -733,7 +906,6 @@ void loop()
         timerProgMode = 0;
     }
 
-    server.handleClient();
     unsigned long currentTime = millis();
     if (rebootRequested != 0 && currentTime > rebootRequested) {
         rebootRequested = 0;
