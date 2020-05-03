@@ -1,5 +1,11 @@
 /*
     DoorBell KNX
+
+    WARNING:
+    WiFiServer.cpp MUST be PATCHED according to bug report (to add SO_REUSEADDR):
+    https://github.com/espressif/arduino-esp32/issues/3960
+    Else no webserver will be able to handle requests after wifi is reset or restarted
+
 */
 #define NO_GLOBAL_INSTANCES
 #define FW_TAG       "DoorBell KNX"
@@ -7,11 +13,11 @@
 
 #define ENABLE_UPDATE
 #define ENABLE_MP3
-#define ENABLE_FLAC
-#define ENABLE_WAV
+//#define ENABLE_FLAC
+//#define ENABLE_WAV    // SPIFFS too slow
 //#define ENABLE_MIDI   // https://github.com/earlephilhower/ESP8266Audio/issues/240 + printf in midi + tinysoundfont
-#define ENABLE_MOD
-#define ENABLE_AAC
+//#define ENABLE_MOD    // Poor quality on SPIFFS
+//#define ENABLE_AAC
 
 #include <Arduino.h>
 #include <esp_pm.h>
@@ -20,7 +26,7 @@
 #include <SPIFFS.h>
 #include <AudioFileSourceSPIFFS.h>
 #ifdef ENABLE_MP3
-  #ifdef ENABLE_AAC
+  #if 0 // Lower Quality
     #include <AudioGeneratorMP3a.h>
     typedef AudioGeneratorMP3a AudioGeneratorMP3;
   #else
@@ -47,12 +53,11 @@
   #include <Update.h>
 #endif
 #include <WiFiManager.h>
-#include "Arduino.h"
-#include <WiFiClient.h>
-#include <EEPROM.h>
+#include <Arduino.h>
 #include <WebServer.h>
 
-#define WATCHDOG_TIMEOUT  (10 * 60 * 1000 * 1000)
+#define WATCHDOG_TIMEOUT  (3 * 60 * 1000 * 1000)
+hw_timer_t *watchdog = NULL;
 
 #define SERIAL_DEBUG false               // Enable / Disable log - activer / désactiver le journal
 
@@ -165,7 +170,7 @@ struct Player
 
         m_mutePin = mutePinNb;
         pinMode(m_mutePin, OUTPUT);
-//        pinMode(pinNb, ANALOG);
+        digitalWrite(m_mutePin, true);
         m_out.SetOutputModeMono(true);
         autodetect();
     }
@@ -200,12 +205,12 @@ struct Player
             }
           });
         m_GO.volume = baseGO + 2;
+        m_params.volume = knx.paramByte(baseAddr);
+        setVolume(m_params.volume);
         knx.getGroupObject(m_GO.volume).dataPointType(DPT_Scaling);
         knx.getGroupObject(m_GO.volume).callback([this](GroupObject& go) {
             setVolume(go.value());
           });
-        if ((uint8_t)knx.getGroupObject(m_GO.volume).value() == 0)   // Not initialised if 0 (volume is offset by 1)
-            setVolume(100);
         m_GO.block = baseGO + 3;
         knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
         m_GO.playing = baseGO + 4;
@@ -226,6 +231,10 @@ struct Player
         }
     }
 
+    void pauseResume() {
+        if (m_player) m_action = m_action==PAUSE?RESUME:PAUSE;
+    }
+
     void stop() {
         if (m_player) m_action = STOP;
     }
@@ -240,16 +249,16 @@ struct Player
         return NO_FILE;
     }
 
-    uint8_t volume() const { return m_volume; }
+    uint8_t volume() const { return m_params.volume; }
     void setVolume(uint8_t value)
     {
         if (knx.configured())
-            knx.getGroupObject(m_GO.volume).value(value + 1);   // offset 1 because 0 is reserved when not init
+            knx.getGroupObject(m_GO.volume).value(value);
         _setVolume(value);
     }
     void setVolume(const KNXValue& value)
     {
-        _setVolume((uint8_t)value - 1);
+        _setVolume((uint8_t)value);
     }
 
     void autodetect(uint32_t channel = UINT32_MAX) {
@@ -341,6 +350,12 @@ struct Player
         }
     }
 
+    void clean()
+    {
+        clear();
+        memset(m_format, 0, sizeof(m_format));
+        memset(m_names, 0, sizeof(m_names));
+    }
 #ifdef ENABLE_MIDI
     bool hasSoundFont() const
     {
@@ -362,12 +377,12 @@ struct Player
 #ifdef ENABLE_MIDI
             case MIDI: {
                 if (hasSoundFont()) {
-                    AudioGeneratorMIDI* midiGen = new AudioGeneratorMIDI();
+                    AudioGeneratorMIDI* midi = new AudioGeneratorMIDI();
                     delete m_sf2;
                     m_sf2 = new AudioFileSourceSPIFFS(SOUNDFONT_PATH);
-                    midiGen->SetSoundfont(m_sf2);
-                    midiGen->SetSampleRate(22050);
-                    return midiGen;
+                    midi->SetSoundfont(m_sf2);
+                    midi->SetSampleRate(22050);
+                    return midi;
                 }
              } break;
 #endif
@@ -378,7 +393,13 @@ struct Player
             case WAV: return new AudioGeneratorWAV(); break;
 #endif
 #ifdef ENABLE_MOD
-            case MOD: return new AudioGeneratorMOD(); break;
+            case MOD: {
+                AudioGeneratorMOD* mod = new AudioGeneratorMOD();
+                mod->SetBufferSize(3*1024);
+                mod->SetSampleRate(22050);
+                mod->SetStereoSeparation(32);
+                return mod;
+            }; break;
 #endif
             default: break;
         }
@@ -397,14 +418,18 @@ struct Player
                     if (m_file) {
                         m_player = audioGeneratorbuilder(channel);
                         if (m_player) {
-                            if (knx.configured()) {
-                                knx.getGroupObject(m_GO.playingChannel).value(channel);
-                                knx.getGroupObject(m_GO.play[channel - 1]).value(true);
-                                knx.getGroupObject(m_GO.playing).value(true);
+                            if (m_player->begin(m_file, &m_out)) {
+                                if (knx.configured()) {
+                                    knx.getGroupObject(m_GO.playingChannel).value(channel);
+                                    knx.getGroupObject(m_GO.play[channel - 1]).value(true);
+                                    knx.getGroupObject(m_GO.playing).value(true);
+                                }
+                                digitalWrite(m_mutePin, false);
+                                m_playingChannel = channel;
                             }
-                            m_player->begin(m_file, &m_out);
-                            digitalWrite(m_mutePin, false);
-                            m_playingChannel = channel;
+                            else {
+                                clear();
+                            }
                         }
                         else {
                             delete m_file; m_file = NULL;
@@ -431,6 +456,7 @@ struct Player
                         knx.getGroupObject(m_GO.playing).value(false);
                         knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(false);
                     }
+                    digitalWrite(m_mutePin, true);
                 }
             }; break;
             case RESUME: {
@@ -439,6 +465,7 @@ struct Player
                         knx.getGroupObject(m_GO.playing).value(true);
                         knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(true);
                     }
+                    digitalWrite(m_mutePin, false);
                 }
                 m_action = NONE;
             }; break;
@@ -481,14 +508,14 @@ struct Player
 
     void _setVolume(uint8_t value)
     {
-        m_volume = value;
+        m_params.volume = value;
         m_out.SetGain(MIN(value, 100) * 4.f / 100);
     }
 
-    uint8_t m_volume = 100;
     enum ACTION { NONE, STOP, PLAY, PAUSE, RESUME } m_action;
     int m_playingChannel;
     struct {
+        uint8_t volume = 100;
     } m_params;
     struct {
       uint16_t playStop;
@@ -503,7 +530,7 @@ struct Player
     AudioGenerator *m_player = NULL;
     AudioFileSourceSPIFFS *m_file = NULL;
     AudioFileSourceSPIFFS *m_sf2 = NULL;
-    AudioOutputI2S m_out = AudioOutputI2S(PIN_DAC, AudioOutputI2S::INTERNAL_DAC);
+    AudioOutputI2S m_out = AudioOutputI2S(PIN_DAC, AudioOutputI2S::INTERNAL_DAC, 128);
     FORMAT m_format[NBBANKS];
     char m_names[NBBANKS][BANK_MAXNAMESIZE];
   public:
@@ -519,17 +546,20 @@ struct Player
 #define URI_STATUS "/status"
 #define URI_PLAY "/play"
 #define URI_STOP "/stop"
+#define URI_PAUSE "/pause"
 #define URI_VOLUME "/volume"
 #define URI_FORMAT "/format"
 #define URI_REMOVE "/remove"
 #define URI_ROOT "/"
 
 WebServer server ( WEB_SERVER_PORT );
+enum SERVER_STATE: uint8_t { DISCONNECTED, CONNECTING, CONNECTED, RUNNING } serverState = DISCONNECTED;
 
 #define REBOOT_TIMER (1)
 #define OTA_REBOOT_TIMER (1)
 
 int64_t rebootRequested = 0;
+bool wifiResetRequested = false;
 
 static void requestReboot(int timer = REBOOT_TIMER)
 {
@@ -572,6 +602,9 @@ static void initWebServer() {
 #ifdef ENABLE_MIDI
                         "document.getElementById(\"soundfont\").innerHTML = obj.hasSoundFont?\"Yes\":\"No\";"
 #endif
+                        "document.getElementById(\"usedSpace\").innerHTML = obj.usedSpace;"
+                        "document.getElementById(\"totalSpace\").innerHTML = obj.totalSpace;"
+                        "document.getElementById(\"freeSpace\").innerHTML = obj.totalSpace-obj.usedSpace;"
                         "document.getElementById(\"bankName\").innerHTML = obj.banks[document.getElementById(\"bank\").value-1].name;"
                         "}"
                     "}"
@@ -600,6 +633,8 @@ static void initWebServer() {
                         "<span class=\"info\">Has SoundFont (sf2 file for MIDI playback): </span><span id=\"soundfont\"></span>"
                         "<br/>"
 #endif
+                        "<span class=\"info\">Space: </span><span id=\"usedSpace\"></span> (Used) / <span id=\"totalSpace\"></span> (Total) / </span><span id=\"freeSpace\"></span> (Free)"
+                        "<br/>"
                         "<span class=\"info\">Playing: </span><span id=\"playing\"></span>"
                     "</td>"
                     "</tr>"
@@ -609,8 +644,28 @@ static void initWebServer() {
                         "<span id=\"bankName\"></span>"
                         "<input type=\"button\" onclick=\"invoke('" URI_PLAY "?id='+document.getElementById('bank').value)\" value=\"Play\"/>"
                         "<input type=\"button\" onclick=\"invoke('" URI_STOP "')\" value=\"Stop\"/>"
+                        "<input type=\"button\" onclick=\"invoke('" URI_PAUSE "')\" value=\"||>\"/>"
                         "<input type=\"button\" onclick=\"invoke('" URI_REMOVE "?id='+document.getElementById('bank').value)\" value=\"Clear\"/>"
-                        "<form id=\"uploadForm\" method=\"post\" enctype=\"multipart/form-data\" action = \"" URI_UPLOAD "?id=1\"><span class=\"action\">Upload: </span><input type=\"file\" name=\"fileToUpload\" id=\"uploadFile\" /><input type=\"submit\" value=\"Upload\" id=\"uploadSubmit\"/></form>"
+                        "<form id=\"uploadForm\" method=\"post\" enctype=\"multipart/form-data\" action = \"" URI_UPLOAD "?id=1\"><span class=\"action\">Upload: </span><input type=\"file\" name=\"fileToUpload\" id=\"uploadFile\" accept=\""
+#ifdef ENABLE_AAC
+                        ".aac,"
+#endif
+#ifdef ENABLE_MP3
+                        ".mp3,"
+#endif
+#ifdef ENABLE_MIDI
+                        ".mid,"
+#endif
+#ifdef ENABLE_FLAC
+                        ".flac,"
+#endif
+#ifdef ENABLE_WAV
+                        ".wav,"
+#endif
+#ifdef ENABLE_MOD
+                        ".mod,"
+#endif
+                        "|audio/*\" /><input type=\"submit\" value=\"Upload\" id=\"uploadSubmit\"/></form>"
                         "<br/>"
                         "Volume: <input type=\"range\" id=\"vol\" min=\"0\" max=\"100\" onchange=\"invoke('" URI_VOLUME "?value='+this.value)\"/>"
                         "<br/>"
@@ -633,6 +688,7 @@ static void initWebServer() {
         server.send(200, F("text/html"), info);
       });
     server.on ( URI_PLAY, [](){ player.play(server.arg("id").toInt()); server.send(200); });
+    server.on ( URI_PAUSE, [](){ player.pauseResume(); server.send(200); });
     server.on ( URI_STOP, [](){ player.stop(); server.send(200); });
     server.on ( URI_VOLUME, [](){ if (!server.arg("value").isEmpty()) player.setVolume(server.arg("value").toInt()); server.send(200); });
     server.on ( URI_STATUS, [](){
@@ -664,17 +720,16 @@ static void initWebServer() {
         server.send(200, F("application/json"), info);
       });
     server.on ( URI_WIFI, [](){
+        wifiResetRequested = true;
         server.send(200);
-        esp_wifi_restore();
-        requestReboot(0);
       });
     server.on ( URI_REBOOT, [](){
         server.send(200);
         requestReboot(0);
       });
     server.on ( URI_FORMAT, [](){
+        player.clean();
         server.send(SPIFFS.format()?200:500);
-        player.autodetect();
         server.send(200);
       });
     server.on ( URI_REMOVE, [](){
@@ -691,6 +746,7 @@ static void initWebServer() {
         server.sendHeader(F("Connection"), F("close"));
         server.send(200, F("text/html"), html);
       }, [](){
+        timerWrite(watchdog, 0); //reset timer (feed watchdog)
         HTTPUpload& upload = server.upload();
         int channel = server.arg("id").toInt();
         static File file;
@@ -749,7 +805,7 @@ static void initWebServer() {
         String html = "<html>"
                         "<head>"
                         "<title>" FW_TAG " - Update</title>" +
-                        (!Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 3) + "; url=/\">" : "") +
+                        (!Update.hasError() ? "<meta http-equiv=\"refresh\" content=\"" + String(OTA_REBOOT_TIMER + 10) + "; url=/\">" : "") +
                         "</head>"
                         "<body>Update " + (Update.hasError() ? "failed" : "succeeded") + "</body>"
                     "</html>";
@@ -757,6 +813,7 @@ static void initWebServer() {
         server.send(200, F("text/html"), html);
         requestReboot();
       }, [](){
+        timerWrite(watchdog, 0); //reset timer (feed watchdog)
         HTTPUpload& upload = server.upload();
         if (upload.status == UPLOAD_FILE_START) {
             if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
@@ -773,7 +830,6 @@ static void initWebServer() {
 #endif
 }
 
-hw_timer_t *watchdog = NULL;
 bool wifiOn = true;
 static bool wifiForProgramming = false;
 void setup()
@@ -819,7 +875,7 @@ void setup()
         for (uint16_t i = 0; i < outputCount; ++i, offsetGO += Output::NBGO, offsetParam += Output::SIZEPARAMS) {
             output[i].init(offsetParam, offsetGO, outputPins[i]);
         }
-        player.initKNX(offsetGO, offsetParam);
+        player.initKNX(offsetParam, offsetGO);
     }
 
     // start the framework.
@@ -834,7 +890,6 @@ void setup()
     initWebServer();
 }
 
-enum SERVER_STATE: uint8_t { DISCONNECTED, CONNECTING, CONNECTED, RUNNING } serverState = DISCONNECTED;
 void loop() 
 {
     timerWrite(watchdog, 0); //reset timer (feed watchdog)
@@ -863,8 +918,6 @@ void loop()
             wm.setConfigPortalTimeout(PROG_TIMEOUT / 1000);
             wm.setLoopCallback(&loop);  // main loop is called
             wm.autoConnect((FW_TAG "-" + String((uint32_t)ESP.getEfuseMac())).c_str(), "");
-            if (serverState == DISCONNECTED)
-                wifiOn = false;
             serverState = WiFi.isConnected()?CONNECTED:DISCONNECTED;
         }
     }
@@ -883,6 +936,12 @@ void loop()
         }
     }
 
+    if (wifiResetRequested) {
+        server.stop();
+        WiFi.disconnect(true, true);
+        serverState = DISCONNECTED;
+        wifiResetRequested = false;
+    }
     static uint32_t timerProgMode = 0;
     if (knx.progMode()) {
         if (timerProgMode == 0) {
