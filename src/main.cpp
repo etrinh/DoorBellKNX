@@ -7,10 +7,10 @@
     Else no webserver will be able to handle requests after wifi is reset or restarted
 
 */
-#define NO_GLOBAL_INSTANCES
 #define FW_TAG       "DoorBell KNX"
 #define FW_VERSION   "1.00"
 
+//#define ENABLE_DEBUG
 #define ENABLE_UPDATE
 #define ENABLE_MP3
 //#define ENABLE_FLAC
@@ -21,6 +21,8 @@
 
 #include <Arduino.h>
 #include <esp_pm.h>
+#include <soc/soc.h>           //disable brownout problems
+#include <soc/rtc_cntl_reg.h>  //disable brownout problems
 #include <knx.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
@@ -106,8 +108,14 @@ struct Output
     void init(int baseAddr, uint16_t baseGO, uint16_t pinNb)
     {
         m_params.autoOffTimer = knx.paramInt(baseAddr) * 100;
-        m_GO.onOff = baseGO;
+        m_GO.onOff = baseGO++;
         knx.getGroupObject(m_GO.onOff).dataPointType(DPT_Switch);
+        m_GO.status = baseGO++;
+        knx.getGroupObject(m_GO.status).dataPointType(DPT_Switch);
+        m_GO.block = baseGO++;
+        knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
+
+        // Callbacks
         knx.getGroupObject(m_GO.onOff).callback([this](GroupObject& go) {
             if (knx.getGroupObject(m_GO.block).value())
                 return;
@@ -121,10 +129,7 @@ struct Output
             digitalWrite(m_pin, value);
             knx.getGroupObject(m_GO.status).value(value);
           });
-        m_GO.status = baseGO + 1;
-        knx.getGroupObject(m_GO.status).dataPointType(DPT_Switch);
-        m_GO.block = baseGO + 2;
-        knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
+
         m_pin = pinNb;
         pinMode(m_pin, OUTPUT);
     }
@@ -161,25 +166,40 @@ struct Player
     enum FORMAT : uint8_t { UNKNOWN = (uint8_t)-1, NO_FILE = 0, MP3, AAC, FLAC, WAV, MOD, MIDI };
     void init(uint16_t pinNb, uint16_t mutePinNb)
     {
-        memset(m_names, 0, sizeof(m_names));
-        File f = SPIFFS.open(META_PATH, FILE_READ);
-        if (f.available()) {
-            f.read((uint8_t*)m_names, sizeof(m_names));
-        }
-        f.close();
-
         m_mutePin = mutePinNb;
         pinMode(m_mutePin, OUTPUT);
         digitalWrite(m_mutePin, true);
         m_out.SetOutputModeMono(true);
-        autodetect();
+
+        memset(&m_content, 0, sizeof(m_content));
+        m_content.volume = 100;
+        File f = SPIFFS.open(META_PATH, FILE_READ);
+        if (f.available()) {
+            f.read((uint8_t*)&m_content, sizeof(m_content));
+        }
+        f.close();
     }
 
     void initKNX(int baseAddr, uint16_t baseGO)
     {
-        (void)baseAddr;
-        m_GO.playStop = baseGO;
+        m_GO.playStop = baseGO++;
         knx.getGroupObject(m_GO.playStop).dataPointType(DPT_Value_1_Ucount);
+        m_GO.pauseResume = baseGO++;
+        knx.getGroupObject(m_GO.pauseResume).dataPointType(DPT_Switch);
+        m_GO.volume = baseGO++;
+        knx.getGroupObject(m_GO.volume).dataPointType(DPT_Scaling);
+        m_GO.block = baseGO++;
+        knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
+        m_GO.playing = baseGO++;
+        knx.getGroupObject(m_GO.playing).dataPointType(DPT_Switch);
+        m_GO.playingChannel = baseGO++;
+        knx.getGroupObject(m_GO.playingChannel).dataPointType(DPT_Value_1_Ucount);
+        for (int i = 0; i < NBBANKS; ++i) {
+            m_GO.play[i] = baseGO++;
+            knx.getGroupObject(m_GO.play[i]).dataPointType(DPT_Switch);
+        }
+
+        // Callbacks
         knx.getGroupObject(m_GO.playStop).callback([this](GroupObject& go) {
             uint32_t value = (uint32_t)go.value();
             if (value) {
@@ -191,8 +211,6 @@ struct Player
                 m_action = STOP;
             }
           });
-        m_GO.pauseResume = baseGO + 1;
-        knx.getGroupObject(m_GO.pauseResume).dataPointType(DPT_Switch);
         knx.getGroupObject(m_GO.pauseResume).callback([this](GroupObject& go) {
             bool value = go.value();
             if (!value) {
@@ -204,23 +222,20 @@ struct Player
                 m_action = PAUSE;
             }
           });
-        m_GO.volume = baseGO + 2;
-        m_params.volume = knx.paramByte(baseAddr);
-        setVolume(m_params.volume);
-        knx.getGroupObject(m_GO.volume).dataPointType(DPT_Scaling);
         knx.getGroupObject(m_GO.volume).callback([this](GroupObject& go) {
             setVolume(go.value());
           });
-        m_GO.block = baseGO + 3;
-        knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
-        m_GO.playing = baseGO + 4;
-        knx.getGroupObject(m_GO.playing).dataPointType(DPT_Switch);
-        m_GO.playingChannel = baseGO + 5;
-        knx.getGroupObject(m_GO.playingChannel).dataPointType(DPT_Value_1_Ucount);
         for (int i = 0; i < NBBANKS; ++i) {
-            m_GO.play[i] = baseGO + 6 + i;
-            knx.getGroupObject(m_GO.play[i]).dataPointType(DPT_Switch);
-            knx.getGroupObject(m_GO.play[i]).callback([this,i](GroupObject& go) { play(i); });
+            knx.getGroupObject(m_GO.play[i]).callback([this,i](GroupObject& go) {
+                println((bool)go.value());
+                println(i);
+                if (go.value()) {
+                    play(i + 1);
+                }
+                else {
+                    m_action = STOP;
+                }
+              });
         }
     }
 
@@ -244,12 +259,12 @@ struct Player
 
     FORMAT format(int bank) const {
         if (pathFromChannel(bank)) {
-            return m_format[bank - 1];
+            return m_content.bank[bank - 1].format;
         }
         return NO_FILE;
     }
 
-    uint8_t volume() const { return m_params.volume; }
+    uint8_t volume() const { return m_content.volume; }
     void setVolume(uint8_t value)
     {
         if (knx.configured())
@@ -261,13 +276,9 @@ struct Player
         _setVolume((uint8_t)value);
     }
 
-    void autodetect(uint32_t channel = UINT32_MAX) {
-        if (channel == UINT32_MAX) {
-            for (int i = 1; i <= NBBANKS; ++i)   autodetect(i);
-            return;
-        }
+    FORMAT autodetect(uint32_t channel = UINT32_MAX) {
         const char* path = pathFromChannel(channel);
-        if (path == NULL) return;
+        if (path == NULL) return NO_FILE;
         FORMAT format = UNKNOWN;
         File f = SPIFFS.open(path, FILE_READ);
         if (f.available()) {
@@ -301,27 +312,31 @@ struct Player
             format = NO_FILE;
         }
         f.close();
-        m_format[channel - 1] = format;
+        return format;
     }
     String channelName(uint32_t channel)
     {
         if (pathFromChannel(channel) == NULL) return String();
         String n;
         n.reserve(BANK_MAXNAMESIZE);
-        char * p = m_names[channel - 1];
+        char * p = m_content.bank[channel - 1].name;
         for (int i = 0; i < BANK_MAXNAMESIZE && *p; ++i, ++p) 
             n += *p;
         return n;
     }
-    void setChannelName(uint32_t channel, String name)
+    void setChannelName(uint32_t channel, String name, FORMAT format)
     {
         if (pathFromChannel(channel) == NULL) return;
-        m_names[channel - 1][0] = 0; 
-        strncpy(m_names[channel - 1], name.c_str(), BANK_MAXNAMESIZE);
-        m_names[channel - 1][MIN(BANK_MAXNAMESIZE - 1, name.length())] = 0;
+        m_content.bank[channel - 1].name[0] = 0;
+        strncpy(m_content.bank[channel - 1].name, name.c_str(), BANK_MAXNAMESIZE);
+        m_content.bank[channel - 1].name[MIN(BANK_MAXNAMESIZE - 1, name.length())] = 0;
+        m_content.bank[channel - 1].format = format;
+    }
+    void flushChannels()
+    {
         File f = SPIFFS.open(META_PATH, "w");
         if (f.available()) {
-            f.write((uint8_t*)m_names, sizeof(m_names));
+            f.write((uint8_t*)&m_content, sizeof(m_content));
         }
         f.close();
     }
@@ -344,17 +359,16 @@ struct Player
     {
         const char* path = pathFromChannel(channel);
         if (path) {
+            setChannelName(channel, String(), NO_FILE);
             SPIFFS.remove(path);
-            setChannelName(channel, String());
-            m_format[channel - 1] = NO_FILE;
         }
     }
 
     void clean()
     {
         clear();
-        memset(m_format, 0, sizeof(m_format));
-        memset(m_names, 0, sizeof(m_names));
+        memset(&m_content, 0, sizeof(m_content));
+        m_content.volume = 100;
     }
 #ifdef ENABLE_MIDI
     bool hasSoundFont() const
@@ -367,7 +381,7 @@ struct Player
         if (pathFromChannel(channel) == NULL) {
             return NULL;
         }
-        switch (m_format[channel - 1]) {
+        switch (m_content.bank[channel - 1].format) {
 #ifdef ENABLE_AAC
             case AAC: return new AudioGeneratorAAC(); break;
 #endif
@@ -508,15 +522,18 @@ struct Player
 
     void _setVolume(uint8_t value)
     {
-        m_params.volume = value;
+        m_content.volume = value;
         m_out.SetGain(MIN(value, 100) * 4.f / 100);
+        File f = SPIFFS.open(META_PATH, "w");
+        if (f.available()) {
+            f.seek((ptrdiff_t)&m_content.volume - (ptrdiff_t)&m_content);
+            f.write((uint8_t*)&m_content.volume, sizeof(m_content.volume));
+        }
+        f.close();
     }
 
     enum ACTION { NONE, STOP, PLAY, PAUSE, RESUME } m_action;
-    int m_playingChannel;
-    struct {
-        uint8_t volume = 100;
-    } m_params;
+    int m_playingChannel = 0;
     struct {
       uint16_t playStop;
       uint16_t pauseResume;
@@ -531,16 +548,22 @@ struct Player
     AudioFileSourceSPIFFS *m_file = NULL;
     AudioFileSourceSPIFFS *m_sf2 = NULL;
     AudioOutputI2S m_out = AudioOutputI2S(PIN_DAC, AudioOutputI2S::INTERNAL_DAC, 128);
-    FORMAT m_format[NBBANKS];
-    char m_names[NBBANKS][BANK_MAXNAMESIZE];
+    struct {
+        struct {
+            char name[BANK_MAXNAMESIZE];
+            FORMAT format;
+        } bank[NBBANKS];
+        uint8_t volume;
+    } m_content;
   public:
-    enum { NBGO = sizeof(m_GO)/sizeof(uint16_t), SIZEPARAMS = sizeof(m_params) };    
+    enum { NBGO = sizeof(m_GO)/sizeof(uint16_t), SIZEPARAMS = 0 };
 } player;
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
 #define URI_WIFI "/reset"
 #define URI_REBOOT "/reboot"
+#define URI_PROGMODE "/progmode"
 #define URI_UPDATE "/update"
 #define URI_UPLOAD "/upload"
 #define URI_STATUS "/status"
@@ -553,7 +576,7 @@ struct Player
 #define URI_ROOT "/"
 
 WebServer server ( WEB_SERVER_PORT );
-enum SERVER_STATE: uint8_t { DISCONNECTED, CONNECTING, CONNECTED, RUNNING } serverState = DISCONNECTED;
+enum SERVER_STATE: uint8_t { DISCONNECTED = 0, CONNECTING, CONNECTED, RUNNING } serverState = DISCONNECTED;
 
 #define REBOOT_TIMER (1)
 #define OTA_REBOOT_TIMER (1)
@@ -606,6 +629,7 @@ static void initWebServer() {
                         "document.getElementById(\"totalSpace\").innerHTML = obj.totalSpace;"
                         "document.getElementById(\"freeSpace\").innerHTML = obj.totalSpace-obj.usedSpace;"
                         "document.getElementById(\"bankName\").innerHTML = obj.banks[document.getElementById(\"bank\").value-1].name;"
+                        "document.getElementById(\"progMode\").innerHTML = obj.progMode?\"on\":\"off\";"
                         "}"
                     "}"
                     "};"
@@ -675,6 +699,8 @@ static void initWebServer() {
                         "<br/>"
                         "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_WIFI "\');return false;\">Reset WiFi</a>"
                         "<br/>"
+                        "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_PROGMODE "\');return false;\">Toggle Program Mode :</a><span id=\"progMode\"></span>"
+                        "<br/>"
 #ifdef ENABLE_UPDATE
                         "<form id=\"upgradeForm\" method=\"post\" enctype=\"multipart/form-data\" action=\"" URI_UPDATE "\"><span class=\"action\">Upgrade Firmware: </span><input type=\"file\" name=\"fileToUpgrade\" id=\"upgradeFile\" /><input type=\"submit\" value=\"Upgrade\" id=\"upgradeSubmit\"/></form>"
                         "<br/>"
@@ -715,12 +741,17 @@ static void initWebServer() {
                         "\"reboot\":\"" + String(rebootRequested > 0 ? "true" : "false") + "\","
                         "\"usedSpace\":" + String(SPIFFS.usedBytes()) + ","
                         "\"totalSpace\":" + String(SPIFFS.totalBytes()) + ","
-                        "\"rebootTimer\":" + String(MAX(0, int((rebootRequested - currentTimer) / 1000))) + ""
+                        "\"rebootTimer\":" + String(MAX(0, int((rebootRequested - currentTimer) / 1000))) + ","
+                        "\"progMode\":" + String(knx.progMode() ? "true" : "false") + ""
                         "}";
         server.send(200, F("application/json"), info);
       });
     server.on ( URI_WIFI, [](){
         wifiResetRequested = true;
+        server.send(200);
+      });
+    server.on ( URI_PROGMODE, [](){
+        knx.progMode(!knx.progMode());
         server.send(200);
       });
     server.on ( URI_REBOOT, [](){
@@ -782,13 +813,11 @@ static void initWebServer() {
 #else
                 {
 #endif
-                    player.autodetect(channel);
+                    player.setChannelName(channel, upload.filename, player.autodetect(channel));
                     if ((player.format(channel) == Player::UNKNOWN || player.format(channel) == Player::NO_FILE)) {
                         player.removeChannel(channel);
                     }
-                    else {
-                        player.setChannelName(channel, upload.filename);
-                    }
+                    player.flushChannels();
                 }
             }
             else {
@@ -830,10 +859,23 @@ static void initWebServer() {
 #endif
 }
 
+static void blink(int nb) {
+    for (int i = 0; i < nb; ++i) {
+        digitalWrite(PIN_PROG_LED, 1);
+        delay(250);
+        digitalWrite(PIN_PROG_LED, 0);
+        delay(250);
+    }
+    delay(1000);
+}
+
 bool wifiOn = true;
 static bool wifiForProgramming = false;
 void setup()
 {
+    pinMode(PIN_PROG_LED, OUTPUT);
+    blink(1);
+
     // Stop Bluetooth
     btStop();
 
@@ -844,17 +886,34 @@ void setup()
     pm_config.light_sleep_enable = false;
     esp_pm_configure(&pm_config);
 
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+
+#ifdef ENABLE_DEBUG
+    Serial.begin(115200);
+    esp_log_level_set("*", ESP_LOG_INFO);
+#else
     // No Debug 
     esp_log_level_set("*", ESP_LOG_NONE);
     uartSetDebug(NULL);
     ArduinoPlatform::SerialDebug = &nullDevice;
+#endif
 
-    static HardwareSerial serialTpuart(TPUART);
-    knx.platform().knxUart(&serialTpuart);
+    pinMode(PIN_PROG_SWITCH, INPUT_PULLUP);
+    knx.platform().knxUart(&Serial2);
     knx.ledPin(PIN_PROG_LED);
     knx.ledPinActiveOn(HIGH);
     knx.buttonPin(PIN_PROG_SWITCH);
     knx.buttonPinInterruptOn(RISING);
+
+    // Init device
+    knx.version(1);                                         // PID_VERSION
+    static const uint8_t orderNumber = 0;
+    knx.orderNumber(&orderNumber);                          // PID_ORDER_INFO
+    // knx.manufacturerId(0xfa);                               // PID_SERIAL_NUMBER (2 first bytes) - 0xfa for KNX Association
+    knx.bauNumber(0x42454c4c /* = 'BELL'*/);     // PID_SERIAL_NUMBER (4 last bytes)
+    static const uint8_t hardwareType [] = { 0, 0, 0, 0, 0, 0 };
+    knx.hardwareType(hardwareType);                         // PID_HARDWARE_TYPE
+    knx.bau().deviceObject().induvidualAddress(1);
 
     // read adress table, association table, groupobject table and parameters from eeprom
     knx.readMemory();
@@ -864,14 +923,15 @@ void setup()
     player.init(PIN_DAC, PIN_MUTE);
 
     if (knx.configured()) {
-        uint16_t offsetGO = 0; int offsetParam = 0;
+        uint16_t offsetGO = 1; int offsetParam = 0;
         // Wifi On/Off
         wifiOn = false;
         wifiForProgramming = false;
         knx.getGroupObject(offsetGO).dataPointType(DPT_Switch);
-        knx.getGroupObject(offsetGO).callback([](GroupObject& go) { wifiOn = go.value(); wifiForProgramming = false; });
-        knx.getGroupObject(offsetGO).value(false);
-        ++offsetGO;
+  //      knx.getGroupObject(offsetGO).valueNoSend(false);
+        knx.getGroupObject(offsetGO + 1 /* status */).dataPointType(DPT_Switch);
+        knx.getGroupObject(offsetGO).callback([offsetGO](GroupObject& go) { wifiOn = go.value(); wifiForProgramming = false; knx.getGroupObject(offsetGO + 1 /* status */).value(wifiOn); });
+        offsetGO += 2;
         for (uint16_t i = 0; i < outputCount; ++i, offsetGO += Output::NBGO, offsetParam += Output::SIZEPARAMS) {
             output[i].init(offsetParam, offsetGO, outputPins[i]);
         }
@@ -888,6 +948,8 @@ void setup()
 
     WiFi.disconnect(true);  // WiFi off managed at runtime
     initWebServer();
+
+    blink(3);
 }
 
 void loop() 
