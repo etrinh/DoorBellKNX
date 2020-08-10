@@ -107,7 +107,7 @@ struct Output
 {
     void init(int baseAddr, uint16_t baseGO, uint16_t pinNb)
     {
-        m_params.autoOffTimer = knx.paramInt(baseAddr) * 100;
+        m_params.autoOffTimer = (knx.paramInt(baseAddr) & 0xFFFF) * 100;    // issue with first short in eeprom (maybe overwritten?) 
         m_GO.onOff = baseGO++;
         knx.getGroupObject(m_GO.onOff).dataPointType(DPT_Switch);
         m_GO.status = baseGO++;
@@ -116,31 +116,35 @@ struct Output
         knx.getGroupObject(m_GO.block).dataPointType(DPT_Switch);
 
         // Callbacks
-        knx.getGroupObject(m_GO.onOff).callback([this](GroupObject& go) {
-            if (knx.getGroupObject(m_GO.block).value())
-                return;
-            bool value = go.value();
-            if (value && m_params.autoOffTimer) {
-                m_timer = millis() + m_params.autoOffTimer;
-            }
-            else {
-                m_timer = 0;
-            }
-            digitalWrite(m_pin, value);
-            knx.getGroupObject(m_GO.status).value(value);
-          });
+        knx.getGroupObject(m_GO.onOff).callback([this](GroupObject& go) {   this->value(go.value());    });
 
         m_pin = pinNb;
         pinMode(m_pin, OUTPUT);
+        digitalWrite(m_pin, LOW);
     }
 
-    void loop(uint32_t delta)
+    void value(bool value) {
+        if (knx.getGroupObject(m_GO.block).value())
+            return;
+        if (value && m_params.autoOffTimer > 0) {
+            m_timer = millis();
+        }
+        else {
+            m_timer = 0;
+        }
+        digitalWrite(m_pin, value?HIGH:LOW);
+        knx.getGroupObject(m_GO.status).value(value);
+    }
+
+    uint32_t autoOffTimer() const { return m_params.autoOffTimer; }
+    bool value() const { return knx.getGroupObject(m_GO.status).value(); }
+
+    void loop(uint32_t time)
     {
         // Manage MONO Stable timer
         if (m_timer) {
-            m_timer += delta;
-            if (m_timer > millis()) {
-                digitalWrite(m_pin, false);
+            if (time - m_params.autoOffTimer >= m_timer) {
+                digitalWrite(m_pin, LOW);
                 knx.getGroupObject(m_GO.status).value(false);
                 m_timer = 0;
             }
@@ -168,7 +172,7 @@ struct Player
     {
         m_mutePin = mutePinNb;
         pinMode(m_mutePin, OUTPUT);
-        digitalWrite(m_mutePin, true);
+        digitalWrite(m_mutePin, HIGH);
         m_out.SetOutputModeMono(true);
 
         memset(&m_content, 0, sizeof(m_content));
@@ -222,13 +226,9 @@ struct Player
                 m_action = PAUSE;
             }
           });
-        knx.getGroupObject(m_GO.volume).callback([this](GroupObject& go) {
-            setVolume(go.value());
-          });
+        knx.getGroupObject(m_GO.volume).callback([this](GroupObject& go) {  setVolume(go.value());  });
         for (int i = 0; i < NBBANKS; ++i) {
             knx.getGroupObject(m_GO.play[i]).callback([this,i](GroupObject& go) {
-                println((bool)go.value());
-                println(i);
                 if (go.value()) {
                     play(i + 1);
                 }
@@ -332,12 +332,10 @@ struct Player
         m_content.bank[channel - 1].name[MIN(BANK_MAXNAMESIZE - 1, name.length())] = 0;
         m_content.bank[channel - 1].format = format;
     }
-    void flushChannels()
+    void flushConfig()
     {
-        File f = SPIFFS.open(META_PATH, "w");
-        if (f.available()) {
-            f.write((uint8_t*)&m_content, sizeof(m_content));
-        }
+        File f = SPIFFS.open(META_PATH, FILE_WRITE);
+        f.write((uint8_t*)&m_content, sizeof(m_content));
         f.close();
     }
     static const char* pathFromChannel(uint32_t channel)
@@ -361,6 +359,7 @@ struct Player
         if (path) {
             setChannelName(channel, String(), NO_FILE);
             SPIFFS.remove(path);
+            flushConfig();
         }
     }
 
@@ -438,7 +437,7 @@ struct Player
                                     knx.getGroupObject(m_GO.play[channel - 1]).value(true);
                                     knx.getGroupObject(m_GO.playing).value(true);
                                 }
-                                digitalWrite(m_mutePin, false);
+                                digitalWrite(m_mutePin, LOW);
                                 m_playingChannel = channel;
                             }
                             else {
@@ -470,7 +469,7 @@ struct Player
                         knx.getGroupObject(m_GO.playing).value(false);
                         knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(false);
                     }
-                    digitalWrite(m_mutePin, true);
+                    digitalWrite(m_mutePin, HIGH);
                 }
             }; break;
             case RESUME: {
@@ -479,7 +478,7 @@ struct Player
                         knx.getGroupObject(m_GO.playing).value(true);
                         knx.getGroupObject(m_GO.play[m_playingChannel - 1]).value(true);
                     }
-                    digitalWrite(m_mutePin, false);
+                    digitalWrite(m_mutePin, LOW);
                 }
                 m_action = NONE;
             }; break;
@@ -503,7 +502,7 @@ struct Player
     {
         m_playingChannel = 0;
         m_action = NONE;
-        digitalWrite(m_mutePin, true);
+        digitalWrite(m_mutePin, HIGH);
         if (m_player)
             m_player->stop();
         if (m_file) {
@@ -524,12 +523,7 @@ struct Player
     {
         m_content.volume = value;
         m_out.SetGain(MIN(value, 100) * 4.f / 100);
-        File f = SPIFFS.open(META_PATH, "w");
-        if (f.available()) {
-            f.seek((ptrdiff_t)&m_content.volume - (ptrdiff_t)&m_content);
-            f.write((uint8_t*)&m_content.volume, sizeof(m_content.volume));
-        }
-        f.close();
+        flushConfig();
     }
 
     enum ACTION { NONE, STOP, PLAY, PAUSE, RESUME } m_action;
@@ -566,6 +560,7 @@ struct Player
 #define URI_PROGMODE "/progmode"
 #define URI_UPDATE "/update"
 #define URI_UPLOAD "/upload"
+#define URI_DOWNLOAD "/download"
 #define URI_STATUS "/status"
 #define URI_PLAY "/play"
 #define URI_STOP "/stop"
@@ -573,6 +568,7 @@ struct Player
 #define URI_VOLUME "/volume"
 #define URI_FORMAT "/format"
 #define URI_REMOVE "/remove"
+#define URI_TOGGLE_OUTPUT "/toggle_output"
 #define URI_ROOT "/"
 
 WebServer server ( WEB_SERVER_PORT );
@@ -629,7 +625,13 @@ static void initWebServer() {
                         "document.getElementById(\"totalSpace\").innerHTML = obj.totalSpace;"
                         "document.getElementById(\"freeSpace\").innerHTML = obj.totalSpace-obj.usedSpace;"
                         "document.getElementById(\"bankName\").innerHTML = obj.banks[document.getElementById(\"bank\").value-1].name;"
-                        "document.getElementById(\"progMode\").innerHTML = obj.progMode?\"on\":\"off\";"
+                        "document.getElementById(\"progMode\").innerHTML = obj.KNX_progMode?\"on\":\"off\";"
+                        "document.getElementById(\"iAddr\").innerHTML = obj.KNX_address;"
+                        "document.getElementById(\"configured\").innerHTML = obj.KNX_configured;"
+                        "document.getElementById(\"output1\").value = obj.output1?\"On\":\"Off\";"
+                        "document.getElementById(\"output2\").value = obj.output2?\"On\":\"Off\";"
+                        "document.getElementById(\"output3\").value = obj.output3?\"On\":\"Off\";"
+                        "document.getElementById(\"output4\").value = obj.output4?\"On\":\"Off\";"
                         "}"
                     "}"
                     "};"
@@ -653,6 +655,10 @@ static void initWebServer() {
                         "<br/>"
                         "<span class=\"info\">MAC: </span><span id=\"mac\"></span>"
                         "<br/>"
+                        "<span class=\"info\">KNX Individual Address: </span><span id=\"iAddr\"></span>"
+                        "<br/>"
+                        "<span class=\"info\">KNX is configured: </span><span id=\"configured\"></span>"
+                        "<br/>"
 #ifdef ENABLE_MIDI
                         "<span class=\"info\">Has SoundFont (sf2 file for MIDI playback): </span><span id=\"soundfont\"></span>"
                         "<br/>"
@@ -670,6 +676,7 @@ static void initWebServer() {
                         "<input type=\"button\" onclick=\"invoke('" URI_STOP "')\" value=\"Stop\"/>"
                         "<input type=\"button\" onclick=\"invoke('" URI_PAUSE "')\" value=\"||>\"/>"
                         "<input type=\"button\" onclick=\"invoke('" URI_REMOVE "?id='+document.getElementById('bank').value)\" value=\"Clear\"/>"
+                        "<input type=\"button\" type=\"submit\" onclick=\"window.open('" URI_DOWNLOAD "?id='+document.getElementById('bank').value)\" value=\"Download\"/>"
                         "<form id=\"uploadForm\" method=\"post\" enctype=\"multipart/form-data\" action = \"" URI_UPLOAD "?id=1\"><span class=\"action\">Upload: </span><input type=\"file\" name=\"fileToUpload\" id=\"uploadFile\" accept=\""
 #ifdef ENABLE_AAC
                         ".aac,"
@@ -693,13 +700,19 @@ static void initWebServer() {
                         "<br/>"
                         "Volume: <input type=\"range\" id=\"vol\" min=\"0\" max=\"100\" onchange=\"invoke('" URI_VOLUME "?value='+this.value)\"/>"
                         "<br/>"
+                        "Output: "
+                        "<input id=\"output1\" type=\"button\" onclick=\"invoke('" URI_TOGGLE_OUTPUT "?id=1'); update();\"/>"
+                        "<input id=\"output2\" type=\"button\" onclick=\"invoke('" URI_TOGGLE_OUTPUT "?id=2'); update();\"/>"
+                        "<input id=\"output3\" type=\"button\" onclick=\"invoke('" URI_TOGGLE_OUTPUT "?id=3'); update();\"/>"
+                        "<input id=\"output4\" type=\"button\" onclick=\"invoke('" URI_TOGGLE_OUTPUT "?id=4'); update();\"/>"
+                        "<br/>"
                         "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_FORMAT "\');return false;\">Remove All Bells</a>"
                         "<br/>"
                         "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_REBOOT "\');return false;\">Reboot Device</a><span id=\"reboot\"></span>"
                         "<br/>"
                         "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_WIFI "\');return false;\">Reset WiFi</a>"
                         "<br/>"
-                        "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_PROGMODE "\');return false;\">Toggle Program Mode :</a><span id=\"progMode\"></span>"
+                        "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_PROGMODE "\');return false;\">Toggle Program Mode</a>: <span id=\"progMode\"></span>"
                         "<br/>"
 #ifdef ENABLE_UPDATE
                         "<form id=\"upgradeForm\" method=\"post\" enctype=\"multipart/form-data\" action=\"" URI_UPDATE "\"><span class=\"action\">Upgrade Firmware: </span><input type=\"file\" name=\"fileToUpgrade\" id=\"upgradeFile\" /><input type=\"submit\" value=\"Upgrade\" id=\"upgradeSubmit\"/></form>"
@@ -717,6 +730,16 @@ static void initWebServer() {
     server.on ( URI_PAUSE, [](){ player.pauseResume(); server.send(200); });
     server.on ( URI_STOP, [](){ player.stop(); server.send(200); });
     server.on ( URI_VOLUME, [](){ if (!server.arg("value").isEmpty()) player.setVolume(server.arg("value").toInt()); server.send(200); });
+    server.on ( URI_TOGGLE_OUTPUT, [](){
+        int id = server.arg("id").toInt() - 1;
+        if (id >= 0 && id < outputCount) {
+            output[id].value(!output[id].value());
+            server.send(200);
+        }
+        else {
+            server.send(404);
+        }
+    });
     server.on ( URI_STATUS, [](){
         unsigned long currentTimer = millis();
         String banks;
@@ -728,21 +751,31 @@ static void initWebServer() {
                         "\"firmware\":\"" FW_TAG "\","
                         "\"version\":\"" FW_VERSION "\","
                         "\"ssid\":\"" + WiFi.SSID() + "\","
-                        "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
+                        "\"rssi\":" + String(WiFi.RSSI()) + ","
                         "\"ip\":\"" + WiFi.localIP().toString() + "\","
                         "\"mac\":\"" + WiFi.macAddress() + "\","
-                        "\"playing\":\"" + String(player.playingBank()) + "\","
+                        "\"playing\":" + String(player.playingBank()) + ","
                         "\"banks\":[" + banks + "],"
 #ifdef ENABLE_MIDI
                         "\"hasSoundFont\":" + String(player.hasSoundFont()) + ","
 #endif
-                        "\"volume\":\"" + String(player.volume()) + "\","
+                        "\"volume\":" + String(player.volume()) + ","
                         "\"chipId\":\"" + String((uint32_t)ESP.getEfuseMac()) + "\","
-                        "\"reboot\":\"" + String(rebootRequested > 0 ? "true" : "false") + "\","
+                        "\"reboot\":" + String(rebootRequested > 0 ? "true" : "false") + ","
                         "\"usedSpace\":" + String(SPIFFS.usedBytes()) + ","
                         "\"totalSpace\":" + String(SPIFFS.totalBytes()) + ","
                         "\"rebootTimer\":" + String(MAX(0, int((rebootRequested - currentTimer) / 1000))) + ","
-                        "\"progMode\":" + String(knx.progMode() ? "true" : "false") + ""
+                        "\"output1\":" + String(output[0].value() ? "true" : "false") + ","
+                        "\"output2\":" + String(output[1].value() ? "true" : "false") + ","
+                        "\"output3\":" + String(output[2].value() ? "true" : "false") + ","
+                        "\"output4\":" + String(output[3].value() ? "true" : "false") + ","
+                        "\"output1_timer\":" + String(output[0].autoOffTimer()) + ","
+                        "\"output2_timer\":" + String(output[1].autoOffTimer()) + ","
+                        "\"output3_timer\":" + String(output[2].autoOffTimer()) + ","
+                        "\"output4_timer\":" + String(output[3].autoOffTimer()) + ","
+                        "\"KNX_address\":\"" + String((knx.induvidualAddress() >> 12) ) + "." + String((knx.induvidualAddress() >> 8) & 0xF) + "." + String(knx.induvidualAddress() & 0xFF) + "\","
+                        "\"KNX_configured\":" + String(knx.configured() ? "true" : "false") + ","
+                        "\"KNX_progMode\":" + String(knx.progMode() ? "true" : "false") + ""
                         "}";
         server.send(200, F("application/json"), info);
       });
@@ -767,6 +800,19 @@ static void initWebServer() {
         int channel = server.arg("id").toInt();
         player.removeChannel(channel);
         server.send(200);
+      });
+    server.on ( URI_DOWNLOAD, HTTP_GET, []() {
+        int channel = server.arg("id").toInt();
+        File download = SPIFFS.open(player.pathFromChannel(channel), FILE_READ);
+        if (download) {
+            server.sendHeader("Content-Type", "text/text");
+            server.sendHeader("Content-Disposition", "attachment; filename=" + player.channelName(channel));
+            server.sendHeader("Connection", "close");
+            server.streamFile(download, "application/octet-stream");
+            download.close();
+        }
+        else
+            server.send(404);
       });
     server.on ( URI_UPLOAD, HTTP_POST, []() {
         const __FlashStringHelper* html = F("<html>"
@@ -817,7 +863,7 @@ static void initWebServer() {
                     if ((player.format(channel) == Player::UNKNOWN || player.format(channel) == Player::NO_FILE)) {
                         player.removeChannel(channel);
                     }
-                    player.flushChannels();
+                    player.flushConfig();
                 }
             }
             else {
@@ -861,9 +907,9 @@ static void initWebServer() {
 
 static void blink(int nb) {
     for (int i = 0; i < nb; ++i) {
-        digitalWrite(PIN_PROG_LED, 1);
+        digitalWrite(PIN_PROG_LED, HIGH);
         delay(250);
-        digitalWrite(PIN_PROG_LED, 0);
+        digitalWrite(PIN_PROG_LED, LOW);
         delay(250);
     }
     delay(1000);
@@ -925,10 +971,9 @@ void setup()
     if (knx.configured()) {
         uint16_t offsetGO = 1; int offsetParam = 0;
         // Wifi On/Off
-        wifiOn = false;
+//        wifiOn = false;
         wifiForProgramming = false;
         knx.getGroupObject(offsetGO).dataPointType(DPT_Switch);
-  //      knx.getGroupObject(offsetGO).valueNoSend(false);
         knx.getGroupObject(offsetGO + 1 /* status */).dataPointType(DPT_Switch);
         knx.getGroupObject(offsetGO).callback([offsetGO](GroupObject& go) { wifiOn = go.value(); wifiForProgramming = false; knx.getGroupObject(offsetGO + 1 /* status */).value(wifiOn); });
         offsetGO += 2;
@@ -961,12 +1006,11 @@ void loop()
 
     // only run the application code if the device was configured with ETS
     if (knx.configured()) {
-        static uint32_t lastTime = 0;
+        static uint32_t lastTime = millis();
         uint32_t time = millis();
-        const uint32_t delta = time - lastTime;
-        if (delta > 10) {
+        if (lastTime + 50 < time) {
             for (int i = 0; i < outputCount; ++i) {
-                output[i].loop(delta);
+                output[i].loop(time);
             }
             lastTime = time;
         }
